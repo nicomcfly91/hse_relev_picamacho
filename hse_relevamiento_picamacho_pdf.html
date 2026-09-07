@@ -1,0 +1,677 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>HSE · Relevamiento picamacho</title>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0f1117;color:#e8eaf0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+       min-height:100vh;display:flex;align-items:center;justify-content:center}
+  .panel{text-align:center;padding:48px 32px;max-width:400px;width:100%}
+  .sp-wrap{width:52px;height:52px;margin:0 auto 28px;position:relative}
+  .sp{width:100%;height:100%;border:3px solid #1e2235;border-top-color:#010066;border-radius:50%;
+      animation:spin .85s linear infinite}
+  .sp.done{border-color:#2ecc71;border-top-color:#2ecc71;animation:none}
+  .sp.error{border-color:#e74c3c;border-top-color:#e74c3c;animation:none}
+  .sp.auth{border-color:#f58321;border-top-color:#f58321}
+  .ic{position:absolute;inset:0;display:none;align-items:center;justify-content:center;font-size:20px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  h1{font-size:18px;font-weight:600;margin-bottom:8px;color:#f1f5f9}
+  .sub{font-size:13px;color:#64748b;line-height:1.6;white-space:pre-line}
+  .bar-wrap{margin-top:24px;background:#1e2235;border-radius:100px;height:3px;overflow:hidden}
+  .bar{height:100%;width:0;background:linear-gradient(90deg,#010066,#1f6f43);border-radius:100px;
+       transition:width .5s ease}
+  .step{margin-top:14px;font-size:11px;color:#334155;font-family:'Courier New',monospace;min-height:14px}
+  .err{display:none;margin-top:20px;background:#1c0a0a;border:1px solid #7f1d1d;border-radius:6px;
+       padding:12px 14px;font-size:12px;color:#fca5a5;text-align:left;line-height:1.7;white-space:pre-wrap}
+  .btn{display:none;margin-top:14px;padding:9px 22px;border:none;border-radius:6px;font-size:13px;
+       font-weight:600;cursor:pointer;background:#010066;color:#fff}
+  .btn:hover{opacity:.85}
+  #stage{position:fixed;left:-99999px;top:0;background:#fff}
+</style>
+</head>
+<body>
+
+<div class="panel">
+  <div class="sp-wrap"><div class="sp" id="sp"></div><div class="ic" id="ic"></div></div>
+  <h1  id="ttl">Iniciando…</h1>
+  <p   id="subt" class="sub">Verificando sesión.</p>
+  <div class="bar-wrap"><div class="bar" id="bar"></div></div>
+  <div class="step" id="log"></div>
+  <div class="err"  id="errbox"></div>
+  <button class="btn" id="btn-retry" onclick="location.reload()">Reintentar</button>
+</div>
+
+<div id="stage"></div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════
+   CONFIGURACIÓN
+   ═══════════════════════════════════════════════════════════════ */
+const CFG = {
+  clientId:        "PiXdJSAHwlLbNnsm",
+  featureLayerUrl: "https://niderasolutions.com/server/rest/services/HSE/HSE_relevamiento_picamacho_2/FeatureServer/0",
+  portalUrl:       "https://niderasolutions.com/portal",
+
+  /* Logo: idealmente el PNG en la misma carpeta que este HTML (ej: "logo_hse.png").
+     Mismo origen = sin problemas de CORS al rasterizar. */
+  logoUrl:         "https://live.staticflickr.com/65535/49502017823_2dfc084f12_o.png",
+
+  headerTitle:     "HSE · Relevamiento picamacho",
+  headerBg:        "#010066",
+
+  incluirAdjuntos: true,
+  maxAdjuntos:     12,
+};
+
+const OAUTH_URL = CFG.portalUrl + "/sharing/rest/oauth2/authorize";
+const REDIRECT  = location.href.split("?")[0].split("#")[0];
+
+/* Geometría A4 */
+const PAGE_W_MM = 210, PAGE_H_MM = 297;
+const MARGIN_MM = 12;
+const CONTENT_W_MM = PAGE_W_MM - MARGIN_MM * 2;
+const CONTENT_H_MM = PAGE_H_MM - MARGIN_MM * 2 - 8;
+const STAGE_W_PX = 700;
+const PX_PER_MM  = STAGE_W_PX / CONTENT_W_MM;
+const MAX_PAGE_PX = CONTENT_H_MM * PX_PER_MM;
+
+/* ═══════════════════════════════════════════════════════════════
+   UI
+   ═══════════════════════════════════════════════════════════════ */
+const $ = id => document.getElementById(id);
+const prog  = p => $("bar").style.width = p + "%";
+const step  = m => $("log").textContent = m;
+const title = (t,s) => { $("ttl").textContent = t; if (s!==undefined) $("subt").textContent = s; };
+
+function icon(c){ const e=$("ic"); e.textContent=c; e.style.display="flex"; }
+function done(){ $("sp").className="sp done"; icon("✓"); prog(100); step("");
+  title("Informe descargado","El PDF se guardó en tu carpeta de descargas."); }
+function fail(m){ $("sp").className="sp error"; icon("✕"); prog(100); $("bar").style.background="#e74c3c";
+  title("No se pudo generar el informe",""); step("");
+  $("errbox").style.display="block"; $("errbox").textContent=m;
+  $("btn-retry").style.display="inline-block"; }
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+
+/* ═══════════════════════════════════════════════════════════════
+   OAUTH
+   ═══════════════════════════════════════════════════════════════ */
+function getToken(){
+  const raw = sessionStorage.getItem("agol_tk");
+  if(!raw) return null;
+  const {tk,exp} = JSON.parse(raw);
+  if(Date.now() > exp){ sessionStorage.removeItem("agol_tk"); return null; }
+  return tk;
+}
+function saveToken(tk,inSec){
+  sessionStorage.setItem("agol_tk", JSON.stringify({tk, exp: Date.now()+(inSec-60)*1000}));
+}
+function doLogin(){
+  const oid = new URLSearchParams(location.search).get("objectId")
+           || new URLSearchParams(location.search).get("objectid");
+  if(oid) sessionStorage.setItem("pending_oid", oid);
+  location.href = OAUTH_URL
+    + "?client_id="    + encodeURIComponent(CFG.clientId)
+    + "&response_type=token&expiration=20160"
+    + "&redirect_uri=" + encodeURIComponent(REDIRECT);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   HELPERS BASE
+   ═══════════════════════════════════════════════════════════════ */
+const isEmpty = v => v === null || v === undefined || v === "";
+
+/* Escapa VALORES que vienen de la base. Los labels del formulario NO pasan
+   por acá: son texto fijo del código. */
+function esc(s){
+  if (isEmpty(s)) return "";
+  return String(s)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+}
+const val = v => esc(v);
+
+/* ─── Respuesta ───────────────────────────────────────────────
+   Se muestra el texto tal cual viene del atributo, sin interpretarlo. */
+function answerCell(v){
+  if (isEmpty(v))
+    return "<span style='font-size:12.5px;color:#aaa;'>—</span>";
+  return "<span style='font-size:12.5px;color:#333;font-weight:600;'>"+esc(v)+"</span>";
+}
+
+/* Número de cumplimiento, sin escala ni semáforo. */
+function formatNum(v){
+  if (isEmpty(v)) return '—';
+  const n = Number(v);
+  if (isNaN(n)) return esc(v);
+  return String(Math.round(n*10)/10).replace('.', ',');
+}
+
+function sectionTitle(t){
+  return "<div style='font-size:13px;font-weight:700;color:#1f6f43;text-transform:uppercase;"
+       + "letter-spacing:0.4px;border-left:4px solid #f58321;padding-left:8px;margin:18px 0 8px 0;'>"
+       + t + "</div>";
+}
+
+/* Caja de cumplimiento — azul institucional, sin semáforo */
+function scoreBox(label, v, big){
+  const txt = formatNum(v);
+  const fs  = big ? '46px'   : '28px';
+  const pad = big ? '18px 0' : '10px 0';
+  const bw  = big ? '2px'    : '1px';
+  const bc  = big ? '#010066': '#eee';
+  return "<div style='text-align:center;background:#f6f7f8;border-radius:12px;padding:"+pad+";"
+       + "margin-top:10px;border:"+bw+" solid "+bc+";'>"
+       + "<div style='font-size:11px;color:#888;text-transform:uppercase;letter-spacing:0.6px;"
+       + "margin-bottom:2px;'>"+label+"</div>"
+       + "<div style='font-size:"+fs+";font-weight:800;color:#010066;line-height:1;'>"+txt+"</div>"
+       + "</div>";
+}
+
+function fechaFmt(v){
+  if (isEmpty(v)) return "";
+  const d = new Date(v);
+  if (isNaN(d)) return String(v);
+  const p = n => String(n).padStart(2,'0');
+  return p(d.getDate())+"/"+p(d.getMonth()+1)+"/"+d.getFullYear();
+}
+
+/* ─── Pregunta ───────────────────────────────────────────────
+   Este formulario no tiene comentarios por pregunta, pero se mantiene
+   el parámetro por consistencia con los otros informes.
+   Cada pregunta marca sus filas con data-qg: la paginación las trata
+   como una unidad. */
+let _qgSeq = 0;
+function qRow(label, valor, comentario){
+  _qgSeq++;
+  const g = " data-qg='"+_qgSeq+"'";
+
+  let h = "<tr"+g+">"
+    + "<td style='padding:7px 8px 7px 4px;color:#333;font-size:12.5px;line-height:1.45;"
+    + "vertical-align:top;'>" + label + "</td>"
+    + "<td style='padding:7px 4px;text-align:right;vertical-align:top;white-space:nowrap;'>"
+    + answerCell(valor) + "</td></tr>";
+
+  if (!isEmpty(comentario)){
+    h += "<tr"+g+"><td colspan='2' style='padding:0 4px 8px 4px;'>"
+      +  "<div style='font-size:11.5px;color:#777;font-style:italic;line-height:1.4;"
+      +  "border-left:2px solid #eee;padding-left:8px;'>"+esc(comentario)+"</div></td></tr>";
+  }
+  h += "<tr"+g+"><td colspan='2' style='padding:0;'>"
+    +  "<div style='border-top:1px solid #f2f2f2;'></div></td></tr>";
+  return h;
+}
+
+const tblOpen  = "<table style='width:100%;border-collapse:collapse;'><tbody>";
+const tblClose = "</tbody></table>";
+
+/* ═══════════════════════════════════════════════════════════════
+   ENCABEZADO INSTITUCIONAL
+   ═══════════════════════════════════════════════════════════════ */
+function headerInstitucional(logoSrc){
+  const logoCell = logoSrc
+    ? "<td style='width:1%;padding:0 14px 0 0;vertical-align:middle;'>"
+      + "<img src='"+logoSrc+"' style='height:46px;width:auto;display:block;'></td>"
+    : "";
+  return "<div style='background:"+CFG.headerBg+";border-radius:12px;padding:12px 16px;margin-bottom:10px;'>"
+       + "<table style='width:100%;border-collapse:collapse;'><tr>"
+       + logoCell
+       + "<td style='vertical-align:middle;color:#ffffff;font-size:14px;font-weight:700;line-height:1.35;'>"
+       + esc(CFG.headerTitle) + "</td>"
+       + "</tr></table></div>";
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ADJUNTOS
+   ═══════════════════════════════════════════════════════════════ */
+function blobToDataURL(blob){
+  return new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload  = () => res(fr.result);
+    fr.onerror = () => rej(new Error("No se pudo leer el adjunto"));
+    fr.readAsDataURL(blob);
+  });
+}
+
+/* Descarga los adjuntos de tipo imagen en base64. Se embeben porque
+   html2canvas no puede pedir una URL que requiere token. */
+async function fetchAdjuntos(objectId, token){
+  const infoUrl = CFG.featureLayerUrl + "/" + objectId
+                + "/attachments?f=json&token=" + encodeURIComponent(token);
+  let infos = [];
+  try{
+    const r = await fetch(infoUrl);
+    const d = await r.json();
+    if (d.error || !d.attachmentInfos) return [];
+    infos = d.attachmentInfos.filter(a => (a.contentType||"").toLowerCase().startsWith("image/"));
+  } catch(e){ return []; }
+
+  infos = infos.slice(0, CFG.maxAdjuntos);
+
+  const out = [];
+  for (let i = 0; i < infos.length; i++){
+    step(`Descargando imagen ${i+1}/${infos.length}…`);
+    const a = infos[i];
+    const fileUrl = CFG.featureLayerUrl + "/" + objectId + "/attachments/" + a.id
+                  + "?token=" + encodeURIComponent(token);
+    try{
+      const fr = await fetch(fileUrl);
+      if (!fr.ok) continue;
+      const blob = await fr.blob();
+      out.push({ name: a.name || ("Imagen "+(i+1)), dataUrl: await blobToDataURL(blob) });
+    } catch(e){ /* si una falla, se saltea */ }
+  }
+  return out;
+}
+
+/* Cada imagen es su propio bloque: la paginación corta entre imágenes,
+   nunca por la mitad de una. */
+function bloquesAdjuntos(adjuntos){
+  if (!adjuntos.length) return [];
+  const blocks = [];
+  adjuntos.forEach((img, i) => {
+    const card =
+      "<div style='margin-top:10px;border:1px solid #eee;border-radius:10px;overflow:hidden;background:#fafafa;'>"
+      + "<div style='text-align:center;padding:8px;'>"
+      + "<img src='"+img.dataUrl+"' style='max-width:100%;max-height:235px;width:auto;height:auto;"
+      + "display:inline-block;border-radius:6px;'></div>"
+      + "<div style='font-size:11px;color:#888;padding:0 10px 8px 10px;text-align:center;"
+      + "word-break:break-all;'>"+esc(img.name)+"</div></div>";
+    blocks.push(i === 0 ? sectionTitle("Registro fotográfico") + card : card);
+  });
+  return blocks;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ARMADO DE BLOQUES
+   ═══════════════════════════════════════════════════════════════ */
+function buildBlocks(f, logoSrc, imagenes){
+
+  const fechaTxt = fechaFmt(f.fecha);
+
+  /* ── Encabezado institucional ── */
+  const headerHSE = headerInstitucional(logoSrc);
+
+  /* ── Encabezado del registro ── */
+  const headerRegistro =
+    "<div style='background:#1f6f43;color:#ffffff;padding:14px 18px;border-radius:10px;'>"
+    + "<div style='font-size:15px;font-weight:700;'>"+val(f.contratista)+"</div>"
+    + "<div style='font-size:12px;opacity:0.85;margin-top:2px;'>"
+    + val(f.zona) + (fechaTxt ? " · "+esc(fechaTxt) : "") + "</div></div>";
+
+  /* ── Información general ── */
+  const infoRow = (k,v) =>
+    "<tr><td style='padding:4px;color:#888;'>"+k+"</td>"
+    + "<td style='padding:4px;text-align:right;font-weight:600;'>"+val(v)+"</td></tr>";
+
+  const gInfo = sectionTitle("Información general")
+    + "<table style='width:100%;border-collapse:collapse;font-size:12.5px;color:#444;'>"
+    + infoRow("Zona",         f.zona)
+    + infoRow("Contratista",  f.contratista)
+    + infoRow("Fecha",        fechaTxt)
+    + "</table>";
+
+  /* ── Grupo: Vehículo agrícola (picamacho) ── */
+  const gVehiculo = sectionTitle("Vehículo agrícola (picamacho)")
+    + tblOpen
+    + qRow("¿El equipo cuenta con protección en sus elementos de transmisión, rotación y movimiento?",
+           f.tractor_proteccion_elem, null)
+    + qRow("¿El equipo cuenta con cabina y/o protección anti vuelco?",
+           f.tractor_cabina, null)
+    + qRow("¿El equipo cuenta con cinturón de seguridad?",
+           f.tractor_cinturon, null)
+    + qRow("¿El equipo cuenta con extintor con carga y habilitación vigente?",
+           f.tractor_extintor, null)
+    + qRow("¿El equipo cuenta con frenos que funcionan satisfactoriamente?",
+           f.tractor_frenos, null)
+    + qRow("¿El equipo cuenta con enganche y pernos en condiciones que impidan un desenganche accidental?",
+           f.tractor_enganche, null)
+    + qRow("¿El equipo cuenta con espejos retrovisores?",
+           f.tractor_espejos, null)
+    + qRow("¿Las luces del equipo funcionan correctamente?",
+           f.tractor_luces, null)
+    + tblClose
+    + scoreBox("Porcentaje de cumplimiento", f.tractor_porcentaje, false);
+
+  /* ── Grupo: Capacitación y protección a los trabajadores ── */
+  const gCapacit = sectionTitle("Capacitación y protección a los trabajadores")
+    + tblOpen
+    + qRow("¿Los trabajadores cuentan con los elementos de protección necesarios de acuerdo a los riesgos a los que están expuestos?",
+           f.capacit_proteccion, null)
+    + qRow("¿Los trabajadores cuentan con capacitaciones acordes a las tareas que desarrollan?",
+           f.capacit_capacitacion, null)
+    + tblClose
+    + scoreBox("Porcentaje de cumplimiento", f.capacit_porcentaje, false);
+
+  /* ── Grupo: Contrato de trabajo y relación de trabajo ── */
+  const gContrato = sectionTitle("Contrato de trabajo y relación de trabajo")
+    + tblOpen
+    + qRow("¿El/los trabajadores que realizan las tareas cuentan con un contrato de trabajo y están afiliados a una ART (en relación de dependencia) o cuentan con monotributo y seguro de accidentes personales (autónomo)?",
+           f.contrato_si_no, null)
+    + tblClose
+    + scoreBox("Porcentaje de cumplimiento", f.contrato_porcentaje, false);
+
+  /* ── Observaciones y comentarios ── */
+  let observaciones = "";
+  if (!isEmpty(f.observaciones)){
+    observaciones = sectionTitle("Observaciones y comentarios")
+      + "<div style='font-size:12.5px;color:#333;line-height:1.5;'>"
+      + esc(f.observaciones) + "</div>";
+  }
+
+  /* ── Resultado final ── */
+  const resultadoFinal =
+    "<hr style='border:none;border-top:1px solid #eee;margin:16px 0 10px 0;'>"
+    + scoreBox("Porcentaje de cumplimiento total", f.porcentaje_final, true);
+
+  /* ── Ensamblado ── */
+  const blocks = [headerHSE, headerRegistro, gInfo, gVehiculo, gCapacit, gContrato];
+  if (observaciones !== "") blocks.push(observaciones);
+  blocks.push(resultadoFinal);
+
+  bloquesAdjuntos(imagenes).forEach(b => blocks.push(b));
+
+  return { blocks, contratista: String(f.contratista||""), fechaTxt };
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   PAGINACIÓN + RASTERIZADO
+   ═══════════════════════════════════════════════════════════════ */
+const SHELL_OPEN =
+  "<div style=\"font-family:'Segoe UI',Arial,sans-serif;background:#ffffff;"
++ "border:1px solid #eaeaea;border-radius:14px;overflow:hidden;padding:16px 18px;\">";
+const SHELL_CLOSE = "</div>";
+
+function makePageEl(){
+  const d = document.createElement("div");
+  d.style.width = STAGE_W_PX + "px";
+  d.style.background = "#fff";
+  d.innerHTML = SHELL_OPEN + SHELL_CLOSE;
+  return d;
+}
+
+function waitForImages(root){
+  const imgs = Array.from(root.querySelectorAll("img"));
+  return Promise.all(imgs.map(im =>
+    (im.complete && im.naturalWidth) ? Promise.resolve()
+      : new Promise(res => { im.onload = res; im.onerror = res; })
+  ));
+}
+
+/* Descompone un bloque para poder repartirlo entre páginas.
+   Si tiene tabla: se separa en encabezado (título), grupos de filas
+   (una pregunta cada uno) y cola (la caja de cumplimiento). */
+function decompose(html){
+  const tmp = document.createElement("div");
+  tmp.innerHTML = html;
+
+  const tabla = tmp.querySelector("table");
+  if (!tabla || tabla.parentNode !== tmp) return { type:"atomic", html };
+
+  let pre = "", post = "", pasada = false;
+  Array.from(tmp.childNodes).forEach(n => {
+    if (n === tabla){ pasada = true; return; }
+    const h = (n.outerHTML !== undefined) ? n.outerHTML : (n.textContent || "");
+    if (pasada) post += h; else pre += h;
+  });
+
+  /* La tabla se reconstruye con SU PROPIA etiqueta de apertura, no con una
+     genérica: si no, pierde sus estilos (font-size, color) al partirse. */
+  const estilo = tabla.getAttribute("style") || "";
+  const aperturaTabla = "<table" + (estilo ? " style='"+estilo+"'" : "") + "><tbody>";
+  const cierreTabla   = "</tbody></table>";
+
+  /* Filas agrupadas por pregunta (data-qg). Las que no tienen
+     atributo — info general — van de a una. */
+  const grupos = [];
+  let actual = null, claveActual = null;
+  Array.from(tabla.querySelectorAll("tr")).forEach(tr => {
+    const k = tr.getAttribute("data-qg");
+    if (k && k === claveActual){ actual.push(tr.outerHTML); }
+    else { actual = [tr.outerHTML]; grupos.push(actual); claveActual = k; }
+  });
+
+  return { type:"table", pre, post, aperturaTabla, cierreTabla,
+           grupos: grupos.map(a => a.join("")) };
+}
+
+async function paginate(blocks){
+  const stage = $("stage");
+  stage.innerHTML = "";
+
+  /* Pasada previa: cargar imágenes para que las medidas sean reales */
+  const warm = document.createElement("div");
+  warm.style.width = STAGE_W_PX + "px";
+  warm.innerHTML = blocks.join("");
+  stage.appendChild(warm);
+  await waitForImages(warm);
+  stage.removeChild(warm);
+
+  const pages = [];
+  let pageEl = makePageEl();
+  stage.appendChild(pageEl);
+  let inner = pageEl.firstElementChild;
+  let count = 0;
+
+  const desborda = () => pageEl.offsetHeight > MAX_PAGE_PX;
+  const nuevaPagina = () => {
+    pages.push(pageEl);
+    pageEl = makePageEl();
+    stage.appendChild(pageEl);
+    inner = pageEl.firstElementChild;
+    count = 0;
+  };
+
+  for (const b of blocks){
+    const d = decompose(b);
+
+    /* ── Bloque indivisible (encabezados, imágenes, resultado) ── */
+    if (d.type === "atomic"){
+      const holder = document.createElement("div");
+      holder.innerHTML = d.html;
+      inner.appendChild(holder);
+      await waitForImages(holder);
+
+      if (desborda() && count > 0){
+        inner.removeChild(holder);
+        nuevaPagina();
+        inner.appendChild(holder);
+      }
+      count++;
+      continue;
+    }
+
+    /* ── Bloque con tabla: se llena pregunta por pregunta ── */
+    let holder = null, tbody = null;
+
+    const abrirTrozo = incluyeTitulo => {
+      holder = document.createElement("div");
+      holder.innerHTML = (incluyeTitulo ? d.pre : "") + d.aperturaTabla + d.cierreTabla;
+      /* Aire extra solo cuando una sección arranca debajo de otra en la
+         misma página. Las continuaciones al tope de página no lo llevan. */
+      if (incluyeTitulo && count > 0) holder.style.marginTop = "14px";
+      inner.appendChild(holder);
+      tbody = holder.querySelector("tbody");
+    };
+
+    abrirTrozo(true);
+    /* Si ni el título entra en lo que queda, se arranca en página nueva */
+    if (desborda() && count > 0){
+      inner.removeChild(holder);
+      nuevaPagina();
+      abrirTrozo(true);
+    }
+    count++;
+
+    for (const g of d.grupos){
+      const antes = tbody.children.length;
+      tbody.insertAdjacentHTML("beforeend", g);
+
+      if (desborda()){
+        while (tbody.children.length > antes) tbody.removeChild(tbody.lastChild);
+
+        if (antes === 0){
+          /* El trozo quedó vacío: se muda entero, título incluido, para
+             no dejar un encabezado huérfano al pie de la página */
+          const teniaTitulo = d.pre !== "" && holder.innerHTML.indexOf(d.pre) === 0;
+          inner.removeChild(holder);
+          if (count > 1) nuevaPagina();
+          abrirTrozo(teniaTitulo);
+        } else {
+          nuevaPagina();
+          abrirTrozo(false);
+        }
+        count = 1;
+        tbody.insertAdjacentHTML("beforeend", g);
+      }
+    }
+
+    /* Cola del bloque (caja de cumplimiento) */
+    if (d.post){
+      const cola = document.createElement("div");
+      cola.innerHTML = d.post;
+      inner.appendChild(cola);
+      if (desborda() && count > 0){
+        inner.removeChild(cola);
+        nuevaPagina();
+        inner.appendChild(cola);
+      }
+      count++;
+    }
+  }
+
+  pages.push(pageEl);
+  return pages;
+}
+
+async function renderPdf(pages, filename){
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ orientation:"portrait", unit:"mm", format:"a4" });
+
+  for (let i = 0; i < pages.length; i++){
+    step(`Renderizando página ${i+1}/${pages.length}…`);
+    prog(75 + (i / pages.length) * 22);
+
+    const canvas = await html2canvas(pages[i], {
+      scale: 2, backgroundColor: "#ffffff", logging: false, useCORS: true, allowTaint: false
+    });
+
+    const imgH_mm = (canvas.height / canvas.width) * CONTENT_W_MM;
+
+    if (i > 0) doc.addPage();
+    doc.addImage(canvas.toDataURL("image/jpeg", 0.94), "JPEG",
+                 MARGIN_MM, MARGIN_MM, CONTENT_W_MM, imgH_mm);
+
+    doc.setFont("helvetica","normal");
+    doc.setFontSize(7.5);
+    doc.setTextColor(150,150,150);
+    doc.text(`Página ${i+1} de ${pages.length}`, PAGE_W_MM - MARGIN_MM, PAGE_H_MM - 6, {align:"right"});
+  }
+  doc.save(filename);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   LOGO
+   ═══════════════════════════════════════════════════════════════ */
+async function resolverLogo(){
+  if (!CFG.logoUrl) return null;
+  try{
+    const r = await fetch(CFG.logoUrl, { mode: "cors" });
+    if (!r.ok) throw new Error();
+    return await blobToDataURL(await r.blob());
+  } catch(e){
+    return CFG.logoUrl;   // fallback: html2canvas intenta con useCORS
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   FLUJO PRINCIPAL
+   ═══════════════════════════════════════════════════════════════ */
+async function run(){
+  const p = new URLSearchParams(location.search);
+  let objectId = p.get("objectId") || p.get("objectid") || sessionStorage.getItem("pending_oid");
+  if (!objectId){ fail("No se recibió el objectId en la URL.\n\nEjemplo: ?objectId=42"); return; }
+
+  let token = getToken();
+  if (!token && location.hash.includes("access_token")){
+    const h = new URLSearchParams(location.hash.replace(/^#/,""));
+    const tk = h.get("access_token");
+    if (tk){
+      saveToken(tk, parseInt(h.get("expires_in")||"3600",10));
+      token = tk;
+      history.replaceState(null,"",location.pathname+"?objectId="+objectId);
+      sessionStorage.removeItem("pending_oid");
+    }
+  }
+  if (!token){
+    $("sp").className = "sp auth";
+    title("Autenticando…","Redirigiendo al portal de ArcGIS.");
+    prog(5); step("Sin sesión — iniciando OAuth…");
+    await sleep(900); doLogin(); return;
+  }
+
+  title("Obteniendo datos…","Consultando la capa de relevamientos.");
+  prog(15); step("Consultando feature service…");
+
+  try{
+    const url = CFG.featureLayerUrl + "/query?" + new URLSearchParams({
+      objectIds: objectId, outFields: "*", returnGeometry: "false", f: "json", token
+    });
+
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status} al consultar la capa.`);
+    const data = await res.json();
+
+    if (data.error){
+      if (data.error.code === 498 || data.error.code === 499){
+        sessionStorage.removeItem("agol_tk");
+        throw new Error("El token expiró. Recargá la página para autenticarte de nuevo.");
+      }
+      throw new Error(data.error.message || JSON.stringify(data.error));
+    }
+    if (!data.features || !data.features.length)
+      throw new Error(`No se encontró ningún registro con objectId = ${objectId}.`);
+
+    const f = data.features[0].attributes;
+
+    prog(28); step("Cargando logo…");
+    const logoSrc = await resolverLogo();
+
+    let imagenes = [];
+    if (CFG.incluirAdjuntos){
+      prog(35); step("Buscando imágenes adjuntas…");
+      imagenes = await fetchAdjuntos(objectId, token);
+    }
+
+    title("Generando informe…","Componiendo el documento.");
+    prog(55); step("Armando secciones…");
+    await sleep(100);
+
+    const { blocks, contratista, fechaTxt } = buildBlocks(f, logoSrc, imagenes);
+
+    prog(65); step("Calculando paginación…");
+    const pages = await paginate(blocks);
+
+    const safe = s => String(s||"registro")
+      .replace(/[^\wáéíóúÁÉÍÓÚñÑ\- ]/g,"").trim().replace(/\s+/g,"_");
+    const filename = `HSE_Picamacho_${safe(contratista)}_${(fechaTxt||"s-f").replace(/\//g,"-")}.pdf`;
+
+    await renderPdf(pages, filename);
+
+    $("stage").innerHTML = "";
+    done();
+
+  } catch(err){
+    fail(err.message);
+  }
+}
+
+run();
+</script>
+</body>
+</html>
